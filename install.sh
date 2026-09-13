@@ -335,48 +335,73 @@ if [ -n "$USER_DOMAIN" ]; then
 
         log_info "Сертификат получен. Запускаем AdGuard и настраиваем TLS через API..."
         "$INSTALL_DIR/AdGuardHome" -s start
-        sleep 3
 
-        # Получаем текущий TLS-конфиг и модифицируем через jq
-        TLS_CFG="$(curl -fsS -u "$ADMIN_USER:$ADMIN_PASS" \
-            http://127.0.0.1:80/control/tls/config)" || {
-            log_warn "Не удалось получить TLS-конфиг через API."
-        }
+        # Ждём, пока API станет доступным с авторизацией.
+        # Раньше был sleep 3 — этого мало, и curl ловил 404 от ещё не поднявшегося handler'а.
+        log_info "Ожидание готовности API (до 60 сек)..."
+        API_READY=false
+        for _ in $(seq 1 60); do
+            if curl -fsS -u "$ADMIN_USER:$ADMIN_PASS" \
+                    http://127.0.0.1:80/control/status >/dev/null 2>&1; then
+                API_READY=true
+                break
+            fi
+            sleep 1
+        done
 
-        if [ -n "$TLS_CFG" ]; then
-            TLS_CFG_NEW="$(echo "$TLS_CFG" | jq \
-                --arg domain "$USER_DOMAIN" \
-                --arg cert "$CERT" \
-                --arg key "$KEY" '
-                .enabled=true |
-                .server_name=$domain |
-                .force_https=true |
-                .port_https=443 |
-                .port_dns_over_tls=853 |
-                .port_dns_over_quic=784 |
-                .certificate_chain="" |
-                .private_key="" |
-                .certificate_path=$cert |
-                .private_key_path=$key |
-                .allow_unencrypted_doh=true |
-                .strict_sni_check=false
-            ')"
+        if [ "$API_READY" != true ]; then
+            log_warn "API AdGuard не ответил на /control/status за 60 сек."
+            log_warn "Включите TLS вручную в веб-панели: Настройки → Шифрование."
+            log_warn "Пути к сертификату:"
+            log_warn "  $CERT"
+            log_warn "  $KEY"
+        else
+            log_info "API готов. Получаю текущий TLS-конфиг..."
 
-            HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-                -X POST http://127.0.0.1:80/control/tls/config \
-                -u "$ADMIN_USER:$ADMIN_PASS" \
-                -H "Content-Type: application/json" \
-                -d "$TLS_CFG_NEW")"
+            # Получаем текущий TLS-конфиг
+            TLS_CFG="$(curl -fsS -u "$ADMIN_USER:$ADMIN_PASS" \
+                http://127.0.0.1:80/control/tls/config)" || {
+                log_warn "Не удалось получить TLS-конфиг через API."
+                log_warn "Включите TLS вручную: Настройки → Шифрование."
+                log_warn "  Сертификат: $CERT"
+                log_warn "  Ключ:       $KEY"
+                TLS_CFG=""
+            }
 
-            if [ "$HTTP_CODE" = "200" ]; then
-                log_info "TLS успешно настроен через API."
-                SSL_SUCCESS=true
-            else
-                log_warn "Не удалось применить TLS-конфиг через API (HTTP $HTTP_CODE)."
-                log_warn "Включите TLS вручную в веб-панели: Настройки → Шифрование."
-                log_warn "Пути к сертификату:"
-                log_warn "  $CERT"
-                log_warn "  $KEY"
+            if [ -n "$TLS_CFG" ]; then
+                TLS_CFG_NEW="$(echo "$TLS_CFG" | jq \
+                    --arg domain "$USER_DOMAIN" \
+                    --arg cert "$CERT" \
+                    --arg key "$KEY" '
+                    .enabled=true |
+                    .server_name=$domain |
+                    .force_https=true |
+                    .port_https=443 |
+                    .port_dns_over_tls=853 |
+                    .port_dns_over_quic=784 |
+                    .certificate_chain="" |
+                    .private_key="" |
+                    .certificate_path=$cert |
+                    .private_key_path=$key |
+                    .allow_unencrypted_doh=true |
+                    .strict_sni_check=false
+                ')"
+
+                HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
+                    -X POST http://127.0.0.1:80/control/tls/config \
+                    -u "$ADMIN_USER:$ADMIN_PASS" \
+                    -H "Content-Type: application/json" \
+                    -d "$TLS_CFG_NEW")"
+
+                if [ "$HTTP_CODE" = "200" ]; then
+                    log_info "TLS успешно настроен через API."
+                    SSL_SUCCESS=true
+                else
+                    log_warn "Не удалось применить TLS-конфиг через API (HTTP $HTTP_CODE)."
+                    log_warn "Включите TLS вручную в веб-панели: Настройки → Шифрование."
+                    log_warn "  Сертификат: $CERT"
+                    log_warn "  Ключ:       $KEY"
+                fi
             fi
         fi
 
