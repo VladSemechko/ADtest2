@@ -121,7 +121,7 @@ log_step "[1/8] Обновление системы и установка зав
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get upgrade -y
-apt-get install -y curl wget ufw ca-certificates jq dnsutils
+apt-get install -y curl wget ufw ca-certificates jq dnsutils python3 python3-yaml
 
 # --- [2/8] Файрвол ---
 log_step "[2/8] Настройка UFW (без сброса существующих правил)"
@@ -333,76 +333,231 @@ if [ -n "$USER_DOMAIN" ]; then
         CERT="/etc/letsencrypt/live/$USER_DOMAIN/fullchain.pem"
         KEY="/etc/letsencrypt/live/$USER_DOMAIN/privkey.pem"
 
-        log_info "Сертификат получен. Запускаем AdGuard и настраиваем TLS через API..."
-        "$INSTALL_DIR/AdGuardHome" -s start
+        log_info "Сертификат получен. Настраиваем TLS..."
 
-        # Ждём, пока API станет доступным с авторизацией.
-        # Раньше был sleep 3 — этого мало, и curl ловил 404 от ещё не поднявшегося handler'а.
-        log_info "Ожидание готовности API (до 60 сек)..."
-        API_READY=false
-        for _ in $(seq 1 60); do
-            if curl -fsS -u "$ADMIN_USER:$ADMIN_PASS" \
-                    http://127.0.0.1:80/control/status >/dev/null 2>&1; then
-                API_READY=true
-                break
+        # Останавливаем AdGuard, чтобы безопасно изменить конфиг.
+        # Прямое редактирование YAML надёжнее API: не зависит от версии AdGuard,
+        # не требует готовности endpoint'ов, работает на всех сборках.
+        "$INSTALL_DIR/AdGuardHome" -s stop
+        sleep 2
+
+        CONFIG_FILE="$INSTALL_DIR/AdGuardHome.yaml"
+        BACKUP_CFG="$CONFIG_FILE.pre-tls.bak.$(date +%Y%m%d_%H%M%S)"
+        cp "$CONFIG_FILE" "$BACKUP_CFG"
+        log_info "Бэкап конфига: $BACKUP_CFG"
+
+        # PyYAML ставим отдельно — в Ubuntu 24.04 по умолчанию её нет
+        if ! python3 -c "import yaml" 2>/dev/null; then
+            log_info "Устанавливаю python3-yaml..."
+            apt-get install -y python3-yaml >/dev/null 2>&1 || true
+        fi
+
+        TLS_CFG_SUCCESS=false
+
+        if python3 -c "import yaml" 2>/dev/null; then
+            log_info "Редактирую конфиг через PyYAML..."
+
+            # Python-скрипт пишет результат в /tmp/tls_apply_result
+            # 0 = успех, 1 = ошибка парсинга, 2 = другая ошибка
+            python3 <<PYEOF || true
+import sys, yaml, io
+
+domain = "$USER_DOMAIN"
+cert = "$CERT"
+key = "$KEY"
+cfg_path = "$CONFIG_FILE"
+result_path = "/tmp/tls_apply_result"
+
+def fail(code, msg):
+    with open(result_path, 'w') as f:
+        f.write(f"{code}:{msg}")
+    sys.exit(code)
+
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+except Exception as e:
+    fail(1, f"YAML parse error: {e}")
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    fail(1, "Top-level YAML is not a dict")
+    sys.exit(1)
+
+# AdGuard Home в разных версиях хранит tls либо на верхнем уровне,
+# либо под dns.tls. Поддерживаем оба варианта.
+tls_section = {
+    'enabled': True,
+    'server_name': domain,
+    'force_https': True,
+    'port_https': 443,
+    'port_dns_over_tls': 853,
+    'port_dns_over_quic': 784,
+    'port_dnscrypt': 0,
+    'dnscrypt_config_file': '',
+    'allow_unencrypted_doh': True,
+    'certificate_chain': '',
+    'private_key': '',
+    'certificate_path': cert,
+    'private_key_path': key,
+    'strict_sni_check': False,
+}
+
+# Определяем, где уже лежит секция tls
+if 'tls' in data and isinstance(data['tls'], dict):
+    # tls на верхнем уровне — обновляем
+    data['tls'].update(tls_section)
+elif 'dns' in data and isinstance(data['dns'], dict) and 'tls' in data['dns'] and isinstance(data['dns']['tls'], dict):
+    # tls под dns — обновляем там
+    data['dns']['tls'].update(tls_section)
+else:
+    # Секции нет — создаём на верхнем уровне (как в дефолтном конфиге AGH v0.107+)
+    data['tls'] = tls_section
+
+# Сохраняем, сохраняя порядок ключей (sort_keys=False)
+try:
+    with open(cfg_path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True, width=1000)
+except Exception as e:
+    fail(2, f"YAML write error: {e}")
+    sys.exit(2)
+
+# Перечитываем для проверки валидности
+try:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        yaml.safe_load(f)
+except Exception as e:
+    fail(1, f"YAML re-parse error after write: {e}")
+    sys.exit(1)
+
+with open(result_path, 'w') as f:
+    f.write("0:ok")
+print("[INFO] TLS секция записана в конфиг.")
+PYEOF
+
+            if [ -f /tmp/tls_apply_result ]; then
+                RESULT="$(cat /tmp/tls_apply_result)"
+                rm -f /tmp/tls_apply_result
+                case "$RESULT" in
+                    0:*)
+                        log_info "TLS настроен в конфиге."
+                        TLS_CFG_SUCCESS=true
+                        ;;
+                    1:*)
+                        log_error "YAML невалиден: ${RESULT#1:}"
+                        log_error "Восстанавливаю из бэкапа..."
+                        cp "$BACKUP_CFG" "$CONFIG_FILE"
+                        ;;
+                    2:*)
+                        log_error "Ошибка записи: ${RESULT#2:}"
+                        log_error "Восстанавливаю из бэкапа..."
+                        cp "$BACKUP_CFG" "$CONFIG_FILE"
+                        ;;
+                    *)
+                        log_error "Неизвестный результат: $RESULT"
+                        cp "$BACKUP_CFG" "$CONFIG_FILE"
+                        ;;
+                esac
+            else
+                log_error "Python-скрипт не отработал. Восстанавливаю из бэкапа..."
+                cp "$BACKUP_CFG" "$CONFIG_FILE"
             fi
-            sleep 1
-        done
-
-        if [ "$API_READY" != true ]; then
-            log_warn "API AdGuard не ответил на /control/status за 60 сек."
-            log_warn "Включите TLS вручную в веб-панели: Настройки → Шифрование."
-            log_warn "Пути к сертификату:"
-            log_warn "  $CERT"
-            log_warn "  $KEY"
         else
-            log_info "API готов. Получаю текущий TLS-конфиг..."
+            log_error "PyYAML недоступна. Восстанавливаю из бэкапа..."
+            cp "$BACKUP_CFG" "$CONFIG_FILE"
+        fi
 
-            # Получаем текущий TLS-конфиг
-            TLS_CFG="$(curl -fsS -u "$ADMIN_USER:$ADMIN_PASS" \
-                http://127.0.0.1:80/control/tls/config)" || {
-                log_warn "Не удалось получить TLS-конфиг через API."
-                log_warn "Включите TLS вручную: Настройки → Шифрование."
-                log_warn "  Сертификат: $CERT"
-                log_warn "  Ключ:       $KEY"
-                TLS_CFG=""
-            }
+        # Fallback через sed — на случай если Python совсем недоступен
+        if [ "$TLS_CFG_SUCCESS" != true ]; then
+            log_info "Применение TLS через Python fallback (regex)..."
+            if python3 - "$CONFIG_FILE" "$USER_DOMAIN" "$CERT" "$KEY" <<'PYFALLBACK' 2>/dev/null
+import sys, re
 
-            if [ -n "$TLS_CFG" ]; then
-                TLS_CFG_NEW="$(echo "$TLS_CFG" | jq \
-                    --arg domain "$USER_DOMAIN" \
-                    --arg cert "$CERT" \
-                    --arg key "$KEY" '
-                    .enabled=true |
-                    .server_name=$domain |
-                    .force_https=true |
-                    .port_https=443 |
-                    .port_dns_over_tls=853 |
-                    .port_dns_over_quic=784 |
-                    .certificate_chain="" |
-                    .private_key="" |
-                    .certificate_path=$cert |
-                    .private_key_path=$key |
-                    .allow_unencrypted_doh=true |
-                    .strict_sni_check=false
-                ')"
+cfg_path = sys.argv[1]
+domain = sys.argv[2]
+cert = sys.argv[3]
+key = sys.argv[4]
 
-                HTTP_CODE="$(curl -s -o /dev/null -w "%{http_code}" \
-                    -X POST http://127.0.0.1:80/control/tls/config \
-                    -u "$ADMIN_USER:$ADMIN_PASS" \
-                    -H "Content-Type: application/json" \
-                    -d "$TLS_CFG_NEW")"
+with open(cfg_path, 'r') as f:
+    lines = f.readlines()
 
-                if [ "$HTTP_CODE" = "200" ]; then
-                    log_info "TLS успешно настроен через API."
-                    SSL_SUCCESS=true
-                else
-                    log_warn "Не удалось применить TLS-конфиг через API (HTTP $HTTP_CODE)."
-                    log_warn "Включите TLS вручную в веб-панели: Настройки → Шифрование."
-                    log_warn "  Сертификат: $CERT"
-                    log_warn "  Ключ:       $KEY"
-                fi
+# Находим секцию tls
+in_tls = False
+out = []
+for line in lines:
+    if re.match(r'^tls:\s*$', line):
+        in_tls = True
+        out.append(line)
+        continue
+    if in_tls:
+        if re.match(r'^\S', line):  # начало новой секции
+            in_tls = False
+            out.append(line)
+        else:
+            # Заменяем значения
+            if re.match(r'^\s*enabled:\s*', line):
+                out.append('  enabled: true\n')
+            elif re.match(r'^\s*server_name:\s*', line):
+                out.append(f'  server_name: "{domain}"\n')
+            elif re.match(r'^\s*force_https:\s*', line):
+                out.append('  force_https: true\n')
+            elif re.match(r'^\s*port_https:\s*', line):
+                out.append('  port_https: 443\n')
+            elif re.match(r'^\s*port_dns_over_tls:\s*', line):
+                out.append('  port_dns_over_tls: 853\n')
+            elif re.match(r'^\s*port_dns_over_quic:\s*', line):
+                out.append('  port_dns_over_quic: 784\n')
+            elif re.match(r'^\s*certificate_path:\s*', line):
+                out.append(f'  certificate_path: "{cert}"\n')
+            elif re.match(r'^\s*private_key_path:\s*', line):
+                out.append(f'  private_key_path: "{key}"\n')
+            elif re.match(r'^\s*allow_unencrypted_doh:\s*', line):
+                out.append('  allow_unencrypted_doh: true\n')
+            elif re.match(r'^\s*strict_sni_check:\s*', line):
+                out.append('  strict_sni_check: false\n')
+            else:
+                out.append(line)
+    else:
+        out.append(line)
+
+with open(cfg_path, 'w') as f:
+    f.writelines(out)
+print("[INFO] TLS применён через Python fallback.")
+PYFALLBACK
+            then
+                TLS_CFG_SUCCESS=true
+            else
+                log_error "Python fallback недоступен или упал. TLS не настроен."
+                SSL_SUCCESS=false
             fi
+        fi
+
+        # Запускаем обратно
+        "$INSTALL_DIR/AdGuardHome" -s start
+        sleep 4
+
+        # Проверяем, что сервис жив
+        if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1:80/" 2>/dev/null; then
+            log_info "AdGuard успешно запущен с TLS."
+            # Дополнительная проверка — доступен ли HTTPS
+            if curl -fsS -o /dev/null --max-time 5 -k "https://127.0.0.1:443/" 2>/dev/null; then
+                log_info "HTTPS (443) — OK."
+                SSL_SUCCESS=true
+            else
+                log_warn "HTTP работает, но HTTPS (443) не отвечает."
+                log_warn "Проверьте логи: journalctl -u AdGuardHome -n 30"
+                SSL_SUCCESS=false
+            fi
+        else
+            log_error "AdGuard не поднялся после включения TLS!"
+            log_error "Последние 20 строк лога:"
+            journalctl -u AdGuardHome --no-pager -n 20 2>/dev/null || true
+            log_error "Восстанавливаю конфиг из бэкапа..."
+            cp "$BACKUP_CFG" "$CONFIG_FILE"
+            "$INSTALL_DIR/AdGuardHome" -s start
+            sleep 3
+            log_warn "AdGuard запущен БЕЗ TLS. Сертификат на месте: $CERT"
+            SSL_SUCCESS=false
         fi
 
         # Hooks для авто-продления сертификата
