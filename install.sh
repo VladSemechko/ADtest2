@@ -55,6 +55,17 @@ fi
 ARCH="$(uname -m)"
 [ "$ARCH" = "x86_64" ] || die "Поддерживается только x86_64 (у вас: $ARCH)."
 
+# Если stdin не терминал (curl|bash, wget -O -|bash, cron, etc.),
+# переключаем интерактивный ввод на /dev/tty — иначе read мгновенно
+# получит EOF и циклы валидации уйдут в бесконечный спам ошибками.
+if [ ! -t 0 ]; then
+    if [ -t 1 ] && [ -c /dev/tty ]; then
+        exec </dev/tty
+    else
+        die "Скрипт требует интерактивного терминала (tty). Не запускайте его в фоне/через cron. Запустите: sudo bash install.sh"
+    fi
+fi
+
 echo -e "${BLUE}${BOLD}"
 echo "================================================"
 echo "   Автоматическая установка AdGuard Home"
@@ -64,27 +75,27 @@ echo -e "${NC}"
 # --- Сбор данных ---
 log_step "Ввод данных"
 
-read -rp "Домен для SSL (например, doh.example.com) [Enter — без SSL]: " USER_DOMAIN
+read -rp "Домен для SSL (например, doh.example.com) [Enter — без SSL]: " USER_DOMAIN || die "Не удалось прочитать ввод (stdin закрыт)."
 USER_DOMAIN="${USER_DOMAIN// /}"
 USER_DOMAIN="${USER_DOMAIN:-}"
 
 USER_EMAIL=""
 if [ -n "$USER_DOMAIN" ]; then
     while true; do
-        read -rp "Email для уведомлений Let's Encrypt: " USER_EMAIL
-        if [[ "$USER_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        read -rp "Email для уведомлений Let's Encrypt: " USER_EMAIL || die "Не удалось прочитать ввод (stdin закрыт)."
+        if [[ "$USER_EMAIL" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$ ]]; then
             break
         fi
-        log_error "Некорректный email. Попробуйте снова."
+        log_error "Некорректный email: '$USER_EMAIL'. Формат: name@example.com"
     done
 fi
 
-read -rp "Логин администратора [admin]: " ADMIN_USER
+read -rp "Логин администратора [admin]: " ADMIN_USER || die "Не удалось прочитать ввод (stdin закрыт)."
 ADMIN_USER="${ADMIN_USER:-admin}"
 
 while true; do
-    read -s -rp "Пароль администратора: " ADMIN_PASS; echo
-    read -s -rp "Повторите пароль: " ADMIN_PASS2; echo
+    read -s -rp "Пароль администратора: " ADMIN_PASS || die "Не удалось прочитать ввод (stdin закрыт)."; echo
+    read -s -rp "Повторите пароль: " ADMIN_PASS2 || die "Не удалось прочитать ввод (stdin закрыт)."; echo
     [ -z "$ADMIN_PASS" ] && { log_error "Пароль не может быть пустым."; continue; }
     [ "$ADMIN_PASS" = "$ADMIN_PASS2" ] && break
     log_error "Пароли не совпадают. Попробуйте снова."
@@ -102,7 +113,7 @@ else
     echo "  SSL:    отключён"
 fi
 echo
-read -rp "Продолжить установку? [y/N]: " CONFIRM
+read -rp "Продолжить установку? [y/N]: " CONFIRM || die "Не удалось прочитать ввод (stdin закрыт)."
 [[ "$CONFIRM" =~ ^[YyДд]$ ]] || { echo "Отменено пользователем."; exit 0; }
 
 # --- [1/8] Зависимости ---
@@ -275,7 +286,7 @@ if [ -n "$USER_DOMAIN" ]; then
         if [ -n "$RESOLVED_IP" ] && [ "$RESOLVED_IP" != "$SERVER_IP" ]; then
             log_warn "Внимание: $USER_DOMAIN резолвится в $RESOLVED_IP, а внешний IP сервера — $SERVER_IP."
             log_warn "Let's Encrypt не сможет подтвердить домен. Настройте A-запись у регистратора."
-            read -rp "Всё равно попытаться выпустить сертификат? [y/N]: " SSL_CONFIRM
+            read -rp "Всё равно попытаться выпустить сертификат? [y/N]: " SSL_CONFIRM || die "Не удалось прочитать ввод (stdin закрыт)."
             if [[ ! "$SSL_CONFIRM" =~ ^[YyДд]$ ]]; then
                 log_info "SSL пропущен по решению пользователя."
                 USER_DOMAIN=""
