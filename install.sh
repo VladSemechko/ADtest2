@@ -217,13 +217,30 @@ log_step "[6/8] Установка и запуск сервиса"
 # Ждём, пока мастер установки поднимется на порту 3000
 log_info "Ожидание мастера установки (порт 3000)..."
 WIZARD_OK=false
-for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:3000/control/status >/dev/null 2>&1; then
-        WIZARD_OK=true
-        break
-    fi
-    sleep 1
-done
+# Мастер установки требует только наличие HTTP-сервера на 3000,
+# endpoint /control/status вернёт 401 (требует auth) даже когда мастер жив.
+# Поэтому проверяем просто доступность порта.
+wait_for_port() {
+    local port="$1"
+    local tries="${2:-60}"
+    for _ in $(seq 1 "$tries"); do
+        if curl -fsS -o /dev/null --max-time 2 "http://127.0.0.1:${port}/" 2>/dev/null; then
+            return 0
+        fi
+        # Двойная проверка через ss — иногда curl не успевает из-за таймаута
+        if ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+log_info "Ожидание мастера установки (порт 3000)..."
+WIZARD_OK=false
+if wait_for_port 3000 30; then
+    WIZARD_OK=true
+fi
 [ "$WIZARD_OK" = true ] || die "AdGuard не запустился на порту 3000. Смотрите: journalctl -u AdGuardHome"
 
 # --- [7/8] Настройка через ОФИЦИАЛЬНЫЙ wizard-API ---
@@ -248,23 +265,26 @@ if [ "$HTTP_CODE" != "200" ]; then
     die "Не удалось настроить AdGuard. Смотрите: journalctl -u AdGuardHome"
 fi
 rm -f /tmp/agh_resp
-log_info "Конфигурация применена. AdGuard переключается на порт 80..."
+log_info "Конфигурация применена."
 
-# AdGuard может не перезапуститься сам — поможем
-sleep 2
-"$INSTALL_DIR/AdGuardHome" -s restart 2>/dev/null || \
-    "$INSTALL_DIR/AdGuardHome" -s start 2>/dev/null || true
-
-# Ждём, пока AdGuard поднимется на порту 80
+# ВАЖНО: AdGuard сам перезапускается после /control/install/configure
+# и переключается с порта 3000 на порт 80. НЕ дёргаем restart/start —
+# это создавало race condition, из-за которого сервис падал.
+# Просто ждём, пока AdGuard поднимется на порту 80.
+log_info "Ожидание запуска AdGuard на порту 80 (до 60 сек)..."
 API_OK=false
-for _ in $(seq 1 30); do
-    if curl -fsS http://127.0.0.1:80/control/status >/dev/null 2>&1; then
-        API_OK=true
-        break
-    fi
-    sleep 1
-done
-[ "$API_OK" = true ] || die "AdGuard не поднялся на порту 80. Смотрите: journalctl -u AdGuardHome"
+if wait_for_port 80 60; then
+    API_OK=true
+fi
+
+if [ "$API_OK" != true ]; then
+    log_error "AdGuard не поднялся на порту 80."
+    log_error "Последние 30 строк лога AdGuardHome:"
+    journalctl -u AdGuardHome --no-pager -n 30 2>/dev/null || \
+        tail -30 "$INSTALL_DIR/data/logs" 2>/dev/null || true
+    die "Смотрите полный лог: journalctl -u AdGuardHome"
+fi
+log_info "AdGuard успешно запущен на порту 80."
 
 # Закрываем временный порт 3000 в файрволе
 ufw delete allow 3000/tcp 2>/dev/null || true
